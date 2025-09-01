@@ -511,7 +511,14 @@ def main(input_path):
     # === Step 1: Load Excel file ===
     # input_path = r"C:\Users\abhay\OneDrive\Desktop\Data filter\INPUT\BROU USD 04 25.xlsx"
     # input_path = r"C:\Users\abhay\OneDrive\Desktop\Data filter\INPUT\Santander Base de Datos .xlsx"
-    final_output_dir = r"C:\Users\abhay\OneDrive\Desktop\Data filter\backend\OUTPUT"
+    # Get current working directory
+    base_dir = os.getcwd()
+
+    # Define output folder path
+    final_output_dir = os.path.join(base_dir, "output")
+
+    # Create folder if it doesn't exist
+    os.makedirs(final_output_dir, exist_ok=True)
 
     if os.path.isfile(input_path):
         try:
