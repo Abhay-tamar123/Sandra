@@ -5,13 +5,14 @@ import gc
 import win32com.client as win32
 import tempfile
 import pythoncom
-from difflib import SequenceMatcher
+# from difflib import SequenceMatcher
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
+import shutil
 
-
-def create_pivot_table(excel_file_path, rename_map):
+def create_pivot_table(excel_file_path):
     try:
-        codigo_name = [k for k, v in rename_map.items() if v == "codigo"][0]
-        print(codigo_name)
         pythoncom.CoInitialize()
         excel = win32.gencache.EnsureDispatch('Excel.Application')
         excel.Visible = False
@@ -39,39 +40,67 @@ def create_pivot_table(excel_file_path, rename_map):
         )
 
         pivot_table = pivot_sheet.PivotTables(pivot_table_name)
-        headers = [ws_data.Cells(1, i).Value for i in range(2, last_col + 1)]
+        headers = [ws_data.Cells(1, i).Value for i in range(1, last_col + 1)]
 
+        # --- Select first column (priority: codigo > Pattern > first header) ---
+        if "codigo" in headers:
+            first_field = "codigo"
+        elif "Pattren" in headers:
+            first_field = "Pattren"
+        else:
+            first_field = headers[0]
+
+        # --- Force first_field into column A ---
+        try:
+            pf = pivot_table.PivotFields(first_field)
+            pf.Orientation = win32.constants.xlRowField
+            pf.Position = 1
+            pf.Subtotals = [False] * 12
+
+            # ✅ Field setting: Repeat item labels (same as UI option)
+            pf.LayoutForm = win32.constants.xlTabularRow
+            pf.RepeatLabels = True  
+
+            print(f"✅ Using '{first_field}' as first row field with repeat labels")
+        except Exception as e:
+            print(f"⚠️ Could not set '{first_field}' as first RowField: {e}")
+
+        # --- Add other row fields (skip first_field, credito, debito) ---
         for header in headers:
-            if header not in [[codigo_name, 'credito', 'debito'], [codigo_name, 'Crédito', 'Débito']]:
+            if header not in [first_field, 'credito', 'debito']:
                 try:
                     pf = pivot_table.PivotFields(header)
                     pf.Orientation = win32.constants.xlRowField
                     pf.Subtotals = [False] * 12
                 except:
                     pass
-# [['Credito', 'Crédito'], ['Debito', 'Débito']]
-        for field in [['Credito', 'Debito'], ['Crédito', 'Débito']]:
-            if field in headers:
+
+        for header in headers:
+            if header not in [first_field, 'Crédito', 'Débito']:
                 try:
-                    pf = pivot_table.PivotFields(field)
-                    pf.Orientation = win32.constants.xlDataField
-                    pf.Function = win32.constants.xlSum
-                    pf.Name = field
-                except Exception as e:
-                    print(f"⚠️ Could not add DataField '{field}': {e}")
+                    pf = pivot_table.PivotFields(header)
+                    pf.Orientation = win32.constants.xlRowField
+                    pf.Subtotals = [False] * 12
+                except:
+                    pass
+
+        # # --- Add DataFields for Credito/Debito ---
+        # for field in ['Credito', 'Debito', 'Crédito', 'Débito']:
+        #     if field in headers:
+        #         try:
+        #             pf = pivot_table.PivotFields(field)
+        #             pf.Orientation = win32.constants.xlDataField
+        #             pf.Function = win32.constants.xlSum
+        #             pf.Name = field
+        #         except Exception as e:
+        #             print(f"⚠️ Could not add DataField '{field}': {e}")
 
         if pivot_table.DataFields.Count == 1:
             try:
                 pivot_table.PivotFields("Data").Orientation = win32.constants.xlHidden
             except Exception:
                 pass
-
-        if codigo_name in headers:
-            try:
-                pivot_table.PivotFields(codigo_name).Orientation = win32.constants.xlPageField
-            except Exception as e:
-                print(f"⚠️ Could not add PageField 'codigo': {e}")
-
+        # --- Layout settings ---
         try:
             pivot_table.RowAxisLayout(win32.constants.xlTabularRow)
             pivot_table.ColumnGrandTotals = False
@@ -92,6 +121,7 @@ def create_pivot_table(excel_file_path, rename_map):
 
 
 
+
 def process_excel_file(df):
     try:
         # === Function: Create Pivot Table ===
@@ -102,7 +132,7 @@ def process_excel_file(df):
             return [x for x in tokens if not (x in seen or seen.add(x))]
 
         df['__pattern_tokens'] = df.apply(lambda row: extract_tokens(row['DESC'], row['codigo']), axis=1)
-        df['Pattren'] = df['__pattern_tokens'].apply(lambda tokens: ', '.join(tokens))
+        df['Pattren'] = df['__pattern_tokens'].apply(lambda tokens: ' '.join(tokens))
 
         def extract_special_pattern(pattern):
             # Match: start digits (before -), then **, then keep 2/xxxxxx
@@ -162,17 +192,26 @@ def process_excel_file(df):
                     removed_info.append((part, "Rule: 1–2 letters, digits, 2+ letters, 2+ digits"))
                     continue
 
+                if re.match(r"RECIBIDA", part):
+                    removed_info.append((part, "Rule: RECIBIDA"))
+                    continue
+
+                if re.match(r"Trf.", part):
+                    removed_info.append((part, "Rule: Trf."))
+                    continue
+
                 # Rule 9: 6+ digits + LR:SPI-PREX + digits
                 if part[:6].isdigit() and part[6:].startswith("LR:SPI-PREX") and part[16:].isdigit():
                     removed_info.append((part, "Rule: 6+ digits + LR:SPI-PREX + digits"))
                     continue
 
+                if re.match(r"^\d{6}[A-Z]{2}\d+$", part):
+                    removed_info.append((part, "Rule: 6 digits + 2 uppercase letters + more digits"))
+                    continue
+
                 # If no rules matched → keep
                 filtered.append(part)
 
-            # Print removed patterns and match source
-            for removed_part, rule in removed_info:
-                print(f"Removed: '{removed_part}' → {rule}")
 
             return ' '.join(filtered)
 
@@ -193,7 +232,8 @@ def process_excel_file(df):
                         patterns[-1] = re.sub(r'\d{7,}', masked, last)
 
                     # Join back into string
-                    result = ', '.join(patterns)
+                    # result = ', '.join(patterns)
+                    result = ' '.join(patterns)
 
                     # 2️⃣ Replace any special character repeated more than 5 times with "**"
                     result = re.sub(r'([^A-Za-z0-9\s])\1{4,}', '**', result)
@@ -206,9 +246,10 @@ def process_excel_file(df):
 
 
 
+
             def should_replace(pattern):
                 pattern = pattern.split()    
-                print(f"Checking pattern: '{len(pattern)}'")
+                # print(f"Checking pattern: '{len(pattern)}'")
                 # Empty pattern
         # If pattern has a single token
                 if len(pattern) == 1:
@@ -231,17 +272,41 @@ def process_excel_file(df):
                 referencia = str(row.get('Referencia', '')).strip()
                 if should_replace(pattern) and referencia:
                     # Split referencia by space and join with comma
-                    referencia_patterns = ','.join(referencia.split())
+                    referencia_patterns = ' '.join(referencia.split())
                     df.at[idx, 'Pattren'] = referencia_patterns
                 elif pattern:
                     df.at[idx, 'Pattren'] = pattern
 
 
+        def replace_with_common_patterns(df, codigo_col='codigo', pattern_col='Pattren'):
+            """
+            For each codigo group:
+            - Find words common to all rows in the group's pattern
+            - If there are >= 2 common words, replace the pattern with only those words
+            """
+            df = df.copy()
+
+            for codigo, group in df.groupby(codigo_col):
+                # Split patterns into sets of words
+                split_patterns = [set(str(p).split()) for p in group[pattern_col]]
+
+                if not split_patterns:
+                    continue
+
+                # Find intersection
+                common_words = set.intersection(*split_patterns)
+
+                # If >= 2 common words, replace each pattern with them (in order from first row)
+                if len(common_words) >= 2:
+                    first_pattern_words = str(group.iloc[0][pattern_col]).split()
+                    ordered_common = [w for w in first_pattern_words if w in common_words]
+
+                    for idx in group.index:
+                        df.at[idx, pattern_col] = ' '.join(ordered_common)
+
+            return df
 
 
-
-        # df['Pattren'] = df['Pattren'].apply(remove_repeated_patterns)
-        df['Pattren'] = df['Pattren'].str.replace(',', '', regex=False)
 
         # === Step 3: Clean numeric fields ===
         for possible_col in [['Credito', 'Crédito'], ['Debito', 'Débito']]:
@@ -257,9 +322,10 @@ def process_excel_file(df):
         df['Pattren'] = df['Pattren'].apply(extract_special_pattern)
         df['Pattren'] = df['Pattren'].apply(drop_first_pattern)
         fill_pattern_with_referencia(df)
-        df['Pattren'] = df['Pattren'].str.replace(',', '', regex=False)
 
         df.drop(columns='__pattern_tokens', inplace=True)
+        df = replace_with_common_patterns(df, codigo_col='codigo', pattern_col='Pattren')
+
         return df
 
     except Exception as e:
@@ -270,12 +336,9 @@ def process_excel_file(df):
 def Pre_Processing(df):
     try:
         columns_name = df.columns.tolist()
-        print(columns_name)
-
-
         required_columns1 = {"Fecha", "Concepto", "Referencia"}
         required_columns2 = {"Fecha valor", "Concepto", "Referencia"}
-        required_columns3 = {"Número de documento", "Descripción", "Dependencia"}
+        required_columns3 = {"Número de documento", "Asunto", "Dependencia"}
 
 #       # Check if the required columns are present in the DataFrame
         if required_columns1.issubset(columns_name):
@@ -299,7 +362,7 @@ def Pre_Processing(df):
             df.to_excel(output_path, index=False)
             temp_file.close()
             print(f"✅ Output saved to temporary file: {output_path}")
-            create_pivot_table(output_path, rename_map)            
+            create_pivot_table(output_path)            
             return output_path
     
 
@@ -325,14 +388,14 @@ def Pre_Processing(df):
             df.to_excel(output_path, index=False)
             temp_file.close()
             print(f"✅ Output saved to temporary file: {output_path}")
-            create_pivot_table(output_path, rename_map)            
+            create_pivot_table(output_path)            
             return output_path
 
 #       # Check if the required columns are present in the DataFrame
         elif required_columns3.issubset(columns_name):
             rename_map = {
                 "Número de documento": "codigo",
-                "Descripción": "DESC",
+                "Asunto": "DESC",
                 "Dependencia": "Referencia"
             }
             df.rename(columns=rename_map, inplace=True)
@@ -340,7 +403,7 @@ def Pre_Processing(df):
             df = process_excel_file(df)
             rename_map1 = {
                 "codigo": "Número de documento",
-                "DESC": "Descripción",
+                "DESC": "Asunto",
                 "Referencia": "Dependencia"
             }
             df.rename(columns=rename_map1, inplace=True)
@@ -350,24 +413,24 @@ def Pre_Processing(df):
             df.to_excel(output_path, index=False)
             temp_file.close()
             print(f"✅ Output saved to temporary file: {output_path}")
-            create_pivot_table(output_path, rename_map)            
+            create_pivot_table(output_path)            
             return output_path
         else:
             df = df.sort_values(by='codigo').reset_index(drop=True)
             df = process_excel_file(df)
-            rename_map1 = {
+            rename_map = {
                             "codigo": "codigo",
                             "DESC": "DESC",
                             "Referencia": "Referencia"
                         }
-            df.rename(columns=rename_map1, inplace=True)
+            df.rename(columns=rename_map, inplace=True)
             df = remove_empty_columns(df)
             temp_file = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
             output_path = temp_file.name
             df.to_excel(output_path, index=False)
             temp_file.close()
             print(f"✅ Output saved to temporary file: {output_path}")
-            create_pivot_table(output_path, rename_map)
+            create_pivot_table(output_path)
             return output_path
 
 
@@ -425,11 +488,29 @@ def process_all_excels_in_folder(input_folder, output_folder):
             else:
                 print(f"ℹ️ Temporary file already moved or deleted: {output_path}")
 
+    output = output_folder
+
+    try:
+        for file_name in os.listdir(output_folder):
+            file_path = os.path.join(output_folder, file_name)
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+                print(f"🗑️ Deleted file: {file_path}")
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path)  # also delete subfolders if any
+                print(f"🗑️ Deleted folder: {file_path}")
+    except Exception as e:
+        print(f"❌ Error deleting files in {output_folder}: {e}")
+
+    return output
 
 
-def main():
+
+
+def main(input_path):
     # === Step 1: Load Excel file ===
-    input_path = r"C:\Users\abhay\OneDrive\Desktop\Data filter\INPUT"
+    # input_path = r"C:\Users\abhay\OneDrive\Desktop\Data filter\INPUT\BROU USD 04 25.xlsx"
+    # input_path = r"C:\Users\abhay\OneDrive\Desktop\Data filter\INPUT\Santander Base de Datos .xlsx"
     final_output_dir = r"C:\Users\abhay\OneDrive\Desktop\Data filter\backend\OUTPUT"
 
     if os.path.isfile(input_path):
@@ -441,25 +522,64 @@ def main():
 
         output_path = Pre_Processing(df)  # This returns the processed file path
 
-        # === Step 6: Save Final Output with Original File Name ===
-        original_filename = os.path.basename(input_path)  # e.g., "BROU USD 06 26.xlsx"
-        final_output_path = os.path.join(final_output_dir, original_filename)
+        return output_path
 
-        os.replace(output_path, final_output_path)
-        print(f"📂 Final output file created: {final_output_path}")
-
-        # === Step 7: Cleanup Temp File ===
-        if os.path.exists(output_path):
-            try:
-                os.remove(output_path)
-                print(f"🗑️ Temporary file deleted: {output_path}")
-            except OSError as e:
-                print(f"❌ Error deleting temporary file {output_path}: {e}")
-        else:
-            print(f"ℹ️ Temporary file already moved or deleted: {output_path}")
     else:
-        process_all_excels_in_folder(input_path, final_output_dir)
+        output = process_all_excels_in_folder(input_path, final_output_dir)
+        return output
         
-if __name__ == "__main__":
-    main()
-    
+
+app = Flask(__name__)
+# IMPORTANT: Adjust origins to match your frontend's URL
+# Added "http://localhost:3000" to the allowed origins
+CORS(app, origins=["http://127.0.0.1:5000", "http://localhost:5173", "http://localhost:3000"])
+
+
+@app.route('/excel_filter', methods=['POST'])
+def excel_filter():
+    try:
+        print("Received request to filter the Excel files...")
+        if 'excel_file_0' not in request.files:
+            return jsonify({"error": "No Excel files found in the request"}), 400
+
+        # Collect all uploaded Excel files
+        excel_files = []
+        for key in request.files:
+            if key.startswith("excel_file_"):
+                file = request.files[key]
+                filename = secure_filename(file.filename)
+                temp_path = os.path.join("temp", filename)
+                os.makedirs("temp", exist_ok=True)
+                file.save(temp_path)
+                excel_files.append(temp_path)
+
+        if not excel_files:
+            return jsonify({"error": "No Excel files uploaded"}), 400
+        
+        print(f"Processing {len(excel_files)} Excel files...")
+        
+        # Process each uploaded file
+        processed_file_paths = []
+
+
+        
+        for file_path in excel_files:
+            output_path = main(file_path)
+            if output_path and os.path.exists(output_path):
+                processed_file_paths.append(output_path)
+            # Clean up the original uploaded temporary file
+            os.remove(file_path)
+
+        if not processed_file_paths:
+            return jsonify({"message": "No patterns were identified in any of the uploaded files."}), 200
+
+        output_file_to_send = processed_file_paths[0]
+        
+                
+        return send_file(output_file_to_send, as_attachment=True, download_name=os.path.basename(output_file_to_send))
+
+    except Exception as e:
+        print(f"Error during processing: {e}")
+        return jsonify({"error": str(e)}), 500
+if __name__ == '__main__':
+    app.run(debug=True) # Run Flask app in debug mode for development
